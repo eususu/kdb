@@ -7,6 +7,7 @@ import * as tika from './lib/tika.js';
 import * as meili from './lib/meili.js';
 import * as ocr from './lib/ocr.js';
 import { buildChunks } from './lib/chunk.js';
+import { toAsciiSlug } from './lib/slug.js';
 
 const app = express();
 app.use(express.json());
@@ -158,12 +159,7 @@ function decodeFilename(name) {
  * debugging and a filename hash keeps the id stable across re-uploads.
  */
 function makeDocId(filename) {
-    const slug = filename
-        .normalize('NFC')
-        .replace(/\.[^.]+$/, '')
-        .replace(/[^A-Za-z0-9]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .slice(0, 40);
+    const slug = toAsciiSlug(filename.replace(/\.[^.]+$/, ''));
     const hash = createHash('sha256').update(filename).digest('hex').slice(0, 12);
     return slug ? `${slug}_${hash}` : `doc_${hash}`;
 }
@@ -227,7 +223,7 @@ app.post('/api/index', upload.single('file'), async (req, res, next) => {
 
         // 3단계: 인덱스 준비 → 이전 청크 제거 → 새 청크 적재
         await meili.ensureIndex(indexName);
-        await meili.deleteDocumentChunks(indexName, docId);
+        await meili.deleteDocumentChunks(indexName, docId, filename);
         const taskUids = await meili.addDocuments(indexName, documents);
 
         const summary = {
@@ -288,7 +284,93 @@ app.post('/api/search', async (req, res, next) => {
     }
 });
 
-// 3. 인덱싱 작업 상태 조회 (202 응답을 받은 경우 확인용)
+// 3. 인덱스 정보 — 기본값은 DEFAULT_INDEX
+app.get('/api/index/info', async (req, res, next) => {
+    try {
+        const indexName = resolveIndex(req.query?.index);
+        const limit = Number(req.query?.limit ?? 100);
+        if (!Number.isInteger(limit) || limit < 0 || limit > 1000) {
+            throw new HttpError(400, 'limit 은 0 이상 1000 이하의 정수여야 합니다.');
+        }
+
+        if (!(await meili.indexExists(indexName))) {
+            return res.json({
+                index: indexName,
+                exists: false,
+                is_default: indexName === config.defaultIndex,
+                chunks: 0,
+                document_count: 0,
+                documents: []
+            });
+        }
+
+        const [stats, settings, summary] = await Promise.all([
+            meili.getStats(indexName),
+            meili.getSettings(indexName),
+            meili.summariseDocuments(indexName, limit)
+        ]);
+
+        res.json({
+            index: indexName,
+            exists: true,
+            is_default: indexName === config.defaultIndex,
+            // Meilisearch counts chunks, since one chunk is one Meilisearch document.
+            chunks: stats.numberOfDocuments,
+            is_indexing: stats.isIndexing,
+            document_count: summary.documentCount,
+            documents: summary.documents,
+            field_distribution: stats.fieldDistribution,
+            settings: {
+                searchable: settings.searchableAttributes,
+                filterable: settings.filterableAttributes,
+                sortable: settings.sortableAttributes
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// 4. 인덱스 리셋 — 파괴적이므로 confirm 에 인덱스 이름을 그대로 넣어야 실행된다
+app.post('/api/index/reset', async (req, res, next) => {
+    try {
+        const indexName = resolveIndex(req.body?.index);
+        const confirm = String(req.body?.confirm ?? '');
+        if (confirm !== indexName) {
+            throw new HttpError(
+                400,
+                `실수 방지를 위해 confirm 에 인덱스 이름을 그대로 넣어야 합니다. 기대값: "${indexName}"`
+            );
+        }
+
+        const mode = req.body?.mode === 'drop' ? 'drop' : 'clear';
+        if (!(await meili.indexExists(indexName))) {
+            return res.status(404).json({
+                success: false,
+                error: `인덱스 "${indexName}" 가 존재하지 않습니다.`
+            });
+        }
+
+        const before = await meili.getStats(indexName);
+        if (mode === 'drop') {
+            await meili.dropIndex(indexName);
+        } else {
+            await meili.clearDocuments(indexName);
+        }
+
+        console.log(`[인덱스 리셋] ${indexName} mode=${mode} 삭제된 청크=${before.numberOfDocuments}`);
+        res.json({
+            success: true,
+            index: indexName,
+            mode,
+            deleted_chunks: before.numberOfDocuments
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// 5. 인덱싱 작업 상태 조회 (202 응답을 받은 경우 확인용)
 app.get('/api/task/:uid', async (req, res, next) => {
     try {
         if (!/^\d+$/.test(req.params.uid)) {
