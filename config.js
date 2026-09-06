@@ -14,15 +14,21 @@ function required(name) {
   return value;
 }
 
-function num(name, fallback) {
+function num(name, fallback, { allowZero = false } = {}) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    console.error(`❌ 환경변수 ${name} 는 양수여야 합니다. 현재 값: ${raw}`);
+  if (!Number.isFinite(parsed) || parsed < 0 || (!allowZero && parsed === 0)) {
+    console.error(`❌ 환경변수 ${name} 는 ${allowZero ? '0 이상' : '양수'}여야 합니다. 현재 값: ${raw}`);
     process.exit(1);
   }
   return parsed;
+}
+
+function bool(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  return /^(1|true|yes|on)$/i.test(raw.trim());
 }
 
 /** Meilisearch index uids and document ids share the same character rules. */
@@ -39,7 +45,23 @@ export const config = {
     maxChars: num('CHUNK_MAX_CHARS', 4000),
     overlapChars: num('CHUNK_OVERLAP_CHARS', 200)
   },
-  maxUploadBytes: num('MAX_UPLOAD_MB', 50) * 1024 * 1024
+  maxUploadBytes: num('MAX_UPLOAD_MB', 50) * 1024 * 1024,
+  ocr: {
+    // OCR needs a vision model, so it is only available when OLLAMA_URL is set.
+    enabled: bool('OCR_ENABLED', true) && Boolean(process.env.OLLAMA_URL),
+    ollamaUrl: (process.env.OLLAMA_URL || '').replace(/\/+$/, ''),
+    model: process.env.OCR_MODEL || 'qwen3.6:35b',
+    // A page holding fewer characters than this is treated as "no text extracted".
+    // Default 1 means only completely empty pages qualify, which keeps OCR from
+    // overwriting short but valid pages such as covers and section dividers.
+    minChars: num('OCR_MIN_CHARS', 1, { allowZero: true }),
+    // Render scale. 2 gives roughly 144 DPI, enough for the models to read body text.
+    scale: num('OCR_SCALE', 2),
+    // Vision inference runs about 10s per page, so cap how much one upload can trigger.
+    maxPages: num('OCR_MAX_PAGES', 20),
+    timeoutMs: num('OCR_TIMEOUT_MS', 120_000),
+    concurrency: num('OCR_CONCURRENCY', 1)
+  }
 };
 
 if (!SAFE_ID.test(config.defaultIndex)) {

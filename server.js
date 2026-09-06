@@ -5,6 +5,7 @@ import multer from 'multer';
 import { config, SAFE_ID } from './config.js';
 import * as tika from './lib/tika.js';
 import * as meili from './lib/meili.js';
+import * as ocr from './lib/ocr.js';
 import { buildChunks } from './lib/chunk.js';
 
 const app = express();
@@ -30,6 +31,115 @@ function resolveIndex(value) {
         throw new HttpError(400, `index 이름은 영숫자, 하이픈, 언더스코어만 쓸 수 있습니다. 받은 값: ${name}`);
     }
     return name;
+}
+
+/** A merged chunk can span several pages, so any OCR'd page in the range taints it. */
+function rangeIncludesOcr(pageStart, pageEnd, ocrPages) {
+    if (ocrPages.size === 0) return false;
+    for (let page = pageStart; page <= pageEnd; page += 1) {
+        if (ocrPages.has(page)) return true;
+    }
+    return false;
+}
+
+const OCR_MODES = new Set(['auto', 'off', 'force']);
+
+function resolveOcrMode(value) {
+    const mode = String(value ?? 'auto').trim().toLowerCase() || 'auto';
+    if (!OCR_MODES.has(mode)) {
+        throw new HttpError(400, `ocr 는 ${[...OCR_MODES].join(', ')} 중 하나여야 합니다. 받은 값: ${mode}`);
+    }
+    return mode;
+}
+
+function isPdf(contentType, filename) {
+    return /pdf/i.test(contentType ?? '') || /\.pdf$/i.test(filename);
+}
+
+/**
+ * Fills in text for pages Tika could not read, by rendering them and running the
+ * Ollama vision model over the images.
+ *
+ * @returns {Promise<{pages: string[]|null, fullText: string, info: object|null}>}
+ */
+async function applyOcr({ buffer, filename, extracted, mode }) {
+    const skip = { pages: extracted.pages, fullText: extracted.fullText, info: null };
+    if (mode === 'off' || !config.ocr.enabled) return skip;
+
+    const { minChars } = config.ocr;
+    const contentType = extracted.contentType ?? '';
+
+    // A directly uploaded image has no page structure; transcribe the file itself.
+    if (/^image\//i.test(contentType)) {
+        if (mode !== 'force' && extracted.fullText.length >= minChars) return skip;
+        try {
+            const text = await ocr.transcribeImage(buffer);
+            if (!text) return skip;
+            return {
+                pages: null,
+                fullText: text,
+                info: { applied: true, target: 'image', pages: [], failures: [], skipped: 0 }
+            };
+        } catch (error) {
+            console.warn(`[OCR 실패] ${filename}: ${error.message}`);
+            return { ...skip, info: { applied: false, target: 'image', error: error.message } };
+        }
+    }
+
+    if (!isPdf(contentType, filename)) return skip;
+
+    // Work out which pages need help. Tika returning nothing at all means every page does.
+    let pages = extracted.pages;
+    if (!pages || pages.length === 0) {
+        const pageCount = await ocr.getPdfPageCount(buffer);
+        if (!pageCount) return skip;
+        pages = Array.from({ length: pageCount }, () => '');
+    }
+
+    const candidates = pages
+        .map((text, index) => ({ page: index + 1, length: text.length }))
+        .filter(({ length }) => mode === 'force' || length < minChars)
+        .map(({ page }) => page);
+
+    if (candidates.length === 0) return skip;
+
+    console.log(`[OCR 시작] ${filename}: ${candidates.length}개 페이지 (모델 ${config.ocr.model})`);
+    const started = Date.now();
+
+    let result;
+    try {
+        result = await ocr.ocrPdfPages(buffer, candidates);
+    } catch (error) {
+        console.warn(`[OCR 실패] ${filename}: ${error.message}`);
+        return { ...skip, info: { applied: false, target: 'pdf', error: error.message } };
+    }
+
+    const merged = [...pages];
+    const replaced = [];
+    for (const [pageNumber, text] of result.texts) {
+        const original = merged[pageNumber - 1] ?? '';
+        // In auto mode, never trade extracted text for a shorter OCR guess. Only `force`
+        // is allowed to overwrite text that Tika read successfully.
+        if (mode !== 'force' && original.length >= text.length) continue;
+        merged[pageNumber - 1] = text;
+        replaced.push(pageNumber);
+    }
+
+    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(`[OCR 완료] ${filename}: ${replaced.length}개 페이지 반영, ${elapsed}s`);
+
+    return {
+        pages: merged,
+        fullText: merged.join(' ').trim(),
+        info: {
+            applied: replaced.length > 0,
+            target: 'pdf',
+            pages: replaced.sort((a, b) => a - b),
+            failures: result.failures,
+            skipped: result.skipped,
+            elapsed_seconds: Number(elapsed)
+        }
+    };
 }
 
 /**
@@ -66,20 +176,38 @@ app.post('/api/index', upload.single('file'), async (req, res, next) => {
         }
 
         const indexName = resolveIndex(req.body?.index);
+        const ocrMode = resolveOcrMode(req.body?.ocr);
         const filename = decodeFilename(req.file.originalname);
         const docId = makeDocId(filename);
-        console.log(`[인덱싱 요청] index=${indexName} 파일=${filename} doc_id=${docId}`);
+        console.log(`[인덱싱 요청] index=${indexName} 파일=${filename} doc_id=${docId} ocr=${ocrMode}`);
 
         // 1단계: Tika 로 텍스트와 페이지 구조 추출
         const extracted = await tika.extract(req.file.buffer, filename);
 
-        // 2단계: 페이지 기준 청킹 (작은 페이지는 병합, 큰 페이지는 겹침 분할)
-        const chunks = buildChunks(extracted, config.chunk);
+        // 2단계: 텍스트가 없는 페이지는 Ollama 비전 모델로 OCR 보완
+        const ocrResult = await applyOcr({
+            buffer: req.file.buffer,
+            filename,
+            extracted,
+            mode: ocrMode
+        });
+        const ocrPages = new Set(ocrResult.info?.pages ?? []);
+
+        // 3단계: 페이지 기준 청킹 (작은 페이지는 병합, 큰 페이지는 겹침 분할)
+        const chunks = buildChunks(
+            { ...extracted, pages: ocrResult.pages, fullText: ocrResult.fullText },
+            config.chunk
+        );
         if (chunks.length === 0) {
-            throw new HttpError(422, '추출된 텍스트가 없습니다. 스캔 이미지 PDF라면 OCR 설정이 필요합니다.');
+            throw new HttpError(
+                422,
+                config.ocr.enabled && ocrMode !== 'off'
+                    ? '텍스트를 추출하지 못했습니다. OCR 도 결과를 내지 못했습니다.'
+                    : '추출된 텍스트가 없습니다. 스캔 이미지 PDF라면 ocr=auto 로 다시 시도해 보세요.'
+            );
         }
 
-        const totalPages = extracted.totalPages ?? extracted.pages?.length ?? null;
+        const totalPages = extracted.totalPages ?? ocrResult.pages?.length ?? null;
         const indexedAt = new Date().toISOString();
         const documents = chunks.map((chunk) => ({
             id: `${docId}_${chunk.suffix}`,
@@ -88,6 +216,11 @@ app.post('/api/index', upload.single('file'), async (req, res, next) => {
             page: chunk.page,
             page_end: chunk.pageEnd,
             total_pages: totalPages,
+            // True when any page covered by this chunk was recovered via OCR, so callers
+            // can treat the text as lower confidence.
+            ocr: chunk.page === null
+                ? ocrResult.info?.target === 'image'
+                : rangeIncludesOcr(chunk.page, chunk.pageEnd, ocrPages),
             content: chunk.text,
             indexed_at: indexedAt
         }));
@@ -102,7 +235,8 @@ app.post('/api/index', upload.single('file'), async (req, res, next) => {
             doc_id: docId,
             filename,
             content_type: extracted.contentType,
-            paged: Boolean(extracted.pages?.length),
+            paged: Boolean(ocrResult.pages?.length),
+            ocr: ocrResult.info,
             total_pages: totalPages,
             chunks: documents.length,
             embedded_parts: extracted.embeddedTexts.length,
@@ -138,7 +272,7 @@ app.post('/api/search', async (req, res, next) => {
             q,
             limit,
             offset,
-            attributesToRetrieve: ['id', 'doc_id', 'filename', 'page', 'page_end', 'total_pages'],
+            attributesToRetrieve: ['id', 'doc_id', 'filename', 'page', 'page_end', 'total_pages', 'ocr'],
             attributesToHighlight: ['content'],
             attributesToCrop: ['content'],
             cropLength: 40
