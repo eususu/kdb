@@ -1,6 +1,10 @@
+import { fileURLToPath } from 'node:url';
+
 // Loads configuration from .env (Node 22+ built-in loader) and validates it once at boot.
+// The path is resolved next to this file rather than from process.cwd(), so the server
+// behaves the same whether it is started by hand, by just, or by pm2.
 try {
-  process.loadEnvFile();
+  process.loadEnvFile(fileURLToPath(new URL('.env', import.meta.url)));
 } catch {
   // No .env present. Fall through to real environment variables.
 }
