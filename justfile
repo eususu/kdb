@@ -40,7 +40,7 @@ flush:
 
 # 포그라운드 실행. pm2 인스턴스가 떠 있으면 포트가 겹치니 먼저 just stop 할 것.
 dev:
-  node server.js
+  pnpm dev
 
 # 서버 헬스체크
 health:
@@ -49,6 +49,10 @@ health:
 # 인덱스 정보. 생략하면 .env 의 DEFAULT_INDEX 를 본다. 예) just info other_idx
 info index="":
   @port=$(grep -E '^PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' | tail -1); curl -fsS "http://localhost:${port:-3000}/api/index/info?index={{index}}" | python3 -m json.tool
+
+# 검색. 인덱스를 생략하면 .env 의 DEFAULT_INDEX 를 본다. 예) just search "검색어" my_docs 20
+search q index="" limit="10":
+  @port=$(grep -E '^PORT=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]' | tail -1); python3 -c 'import json,sys; b={"q":sys.argv[1],"limit":int(sys.argv[3])}; b.update({"index":sys.argv[2]} if sys.argv[2] else {}); print(json.dumps(b))' {{quote(q)}} {{quote(index)}} {{quote(limit)}} | curl -fsS -X POST "http://localhost:${port:-3000}/api/search" -H 'Content-Type: application/json' -d @- | python3 -m json.tool
 
 # 문서 전체 삭제. 실수 방지를 위해 인덱스명을 직접 넘겨야 한다. 예) just reset my_docs
 reset index:

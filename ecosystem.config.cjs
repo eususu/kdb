@@ -6,7 +6,8 @@ module.exports = {
   apps: [
     {
       name: 'kdb',
-      script: 'server.js',
+      script: 'server.ts',
+      node_args: '--import tsx',
       cwd: __dirname,
       exec_mode: 'fork',
       instances: 1,
@@ -20,7 +21,7 @@ module.exports = {
       restart_delay: 2000,
       // OCR requests can run for minutes; give in-flight work time to drain on restart.
       kill_timeout: 30000,
-      // Config comes from .env, which config.js loads relative to its own directory.
+      // Config comes from .env, which config.ts loads relative to its own directory.
       env: {
         NODE_ENV: 'production'
       },

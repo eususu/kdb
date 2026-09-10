@@ -9,7 +9,7 @@ try {
   // No .env present. Fall through to real environment variables.
 }
 
-function required(name) {
+function required(name: string) {
   const value = process.env[name];
   if (!value) {
     console.error(`❌ 환경변수 ${name} 가 설정되지 않았습니다. .env.example 을 참고해 .env 를 만들어 주세요.`);
@@ -18,7 +18,7 @@ function required(name) {
   return value;
 }
 
-function num(name, fallback, { allowZero = false } = {}) {
+function num(name: string, fallback: number, { allowZero = false } = {}) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
   const parsed = Number(raw);
@@ -29,7 +29,7 @@ function num(name, fallback, { allowZero = false } = {}) {
   return parsed;
 }
 
-function bool(name, fallback) {
+function bool(name: string, fallback: boolean) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
   return /^(1|true|yes|on)$/i.test(raw.trim());

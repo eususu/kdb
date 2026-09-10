@@ -1,10 +1,37 @@
-import { config } from '../config.js';
+import type { IndexedDocument } from './types.ts';
+import { errorMessage } from './types.ts';
+
+interface Task {
+  taskUid: number;
+  status: string;
+  error?: { message?: string };
+}
+interface SearchResult {
+  hits: IndexedDocument[];
+  facetDistribution?: Record<string, Record<string, number>>;
+}
+interface IndexStats {
+  numberOfDocuments: number;
+  isIndexing: boolean;
+  fieldDistribution: Record<string, number>;
+}
+interface IndexSettings {
+  searchableAttributes: string[];
+  filterableAttributes: string[];
+  sortableAttributes: string[];
+}
+class MeiliError extends Error {
+  meiliCode?: string;
+  status?: number;
+}
+
+import { config } from '../config.ts';
 
 const INDEX_SETTINGS = {
   searchableAttributes: ['filename', 'content'],
   // doc_id must be filterable so re-indexing can delete a document's old chunks,
   // and so search can collapse results per document via `distinct`.
-  filterableAttributes: ['doc_id', 'filename', 'page', 'ocr'],
+  filterableAttributes: ['doc_id', 'filename', 'filepath', 'file_hash', 'page', 'ocr'],
   sortableAttributes: ['page', 'indexed_at'],
   // The info endpoint counts chunks per document with a doc_id facet, and the default
   // cap of 100 facet values would silently truncate that list.
@@ -12,9 +39,9 @@ const INDEX_SETTINGS = {
 };
 
 /** Indexes whose settings have already been applied during this process lifetime. */
-const preparedIndexes = new Set();
+const preparedIndexes = new Set<string>();
 
-export async function request(path, { method = 'GET', body } = {}) {
+export async function request<T = Task>(path: string, { method = 'GET', body }: { method?: string; body?: unknown } = {}): Promise<T> {
   const response = await fetch(`${config.meiliUrl}${path}`, {
     method,
     headers: {
@@ -36,20 +63,20 @@ export async function request(path, { method = 'GET', body } = {}) {
 
   if (!response.ok) {
     const detail = data?.message ?? raw.slice(0, 200);
-    const error = new Error(`Meilisearch ${method} ${path} → HTTP ${response.status}: ${detail}`);
+    const error = new MeiliError(`Meilisearch ${method} ${path} → HTTP ${response.status}: ${detail}`);
     error.meiliCode = data?.code;
     error.status = response.status;
     throw error;
   }
 
-  return data;
+  return data as T;
 }
 
 /**
  * Meilisearch applies writes asynchronously. Waiting matters here because a failed
  * task otherwise looks like success to the caller.
  */
-export async function waitForTask(taskUid, timeoutMs = 60_000) {
+export async function waitForTask(taskUid: number, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   let delay = 50;
 
@@ -67,7 +94,7 @@ export async function waitForTask(taskUid, timeoutMs = 60_000) {
 }
 
 /** Creates the index if needed and applies our settings. Cached after the first call. */
-export async function ensureIndex(uid) {
+export async function ensureIndex(uid: string) {
   if (preparedIndexes.has(uid)) return;
 
   if (!(await indexExists(uid))) {
@@ -82,7 +109,7 @@ export async function ensureIndex(uid) {
       // or as an accepted task that later fails. Another request racing us to create
       // the same index lands here too, and is equally harmless.
       const alreadyExists =
-        error.meiliCode === 'index_already_exists' || /already exists/i.test(error.message);
+        (error instanceof MeiliError && error.meiliCode === 'index_already_exists') || /already exists/i.test(errorMessage(error));
       if (!alreadyExists) throw error;
     }
   }
@@ -97,7 +124,7 @@ export async function ensureIndex(uid) {
 }
 
 /** Escapes a value for use inside a double-quoted Meilisearch filter literal. */
-function quoteFilterValue(value) {
+function quoteFilterValue(value: string) {
   return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
@@ -108,7 +135,7 @@ function quoteFilterValue(value) {
  * Matching on filename as well as doc_id matters whenever the id scheme changes: the
  * same file would otherwise produce a new doc_id and strand all of its previous chunks.
  */
-export async function deleteDocumentChunks(uid, docId, filename) {
+export async function deleteDocumentChunks(uid: string, docId: string, filename?: string) {
   const clauses = [`doc_id = ${quoteFilterValue(docId)}`];
   if (filename) clauses.push(`filename = ${quoteFilterValue(filename)}`);
 
@@ -120,8 +147,8 @@ export async function deleteDocumentChunks(uid, docId, filename) {
 }
 
 /** Adds documents in batches so a large PDF does not become one huge request body. */
-export async function addDocuments(uid, documents, batchSize = 200) {
-  const tasks = [];
+export async function addDocuments(uid: string, documents: IndexedDocument[], batchSize = 200) {
+  const tasks: number[] = [];
 
   for (let i = 0; i < documents.length; i += batchSize) {
     const batch = documents.slice(i, i + batchSize);
@@ -135,40 +162,54 @@ export async function addDocuments(uid, documents, batchSize = 200) {
   return tasks;
 }
 
-export async function search(uid, body) {
-  return request(`/indexes/${uid}/search`, { method: 'POST', body });
+export async function search(uid: string, body: Record<string, unknown>) {
+  return request<SearchResult>(`/indexes/${uid}/search`, { method: 'POST', body });
 }
 
-export async function indexExists(uid) {
+export async function indexExists(uid: string) {
   try {
     await request(`/indexes/${uid}`);
     return true;
   } catch (error) {
-    if (error.status === 404) return false;
+    if (error instanceof MeiliError && error.status === 404) return false;
     throw error;
   }
 }
 
-export async function getStats(uid) {
-  return request(`/indexes/${uid}/stats`);
+export async function getStats(uid: string) {
+  return request<IndexStats>(`/indexes/${uid}/stats`);
 }
 
-export async function getSettings(uid) {
-  return request(`/indexes/${uid}/settings`);
+export async function getSettings(uid: string) {
+  return request<IndexSettings>(`/indexes/${uid}/settings`);
 }
 
 /**
  * One entry per indexed document (not per chunk), newest first.
  * Chunk counts come from a doc_id facet because Meilisearch has no group-by.
  */
-export async function summariseDocuments(uid, limit = 100) {
+/**
+ * Finds a document chunk in the index by its file content hash.
+ * Returns the first hit or null.
+ */
+export async function findDocumentByHash(uid: string, fileHash: string) {
+  if (!(await indexExists(uid))) return null;
+  const response = await search(uid, {
+    filter: `file_hash = ${quoteFilterValue(fileHash)}`,
+    limit: 1,
+    attributesToRetrieve: ['doc_id', 'filename', 'filepath', 'file_hash', 'file_size', 'total_pages', 'indexed_at']
+  });
+  return response.hits?.[0] ?? null;
+}
+
+export async function summariseDocuments(uid: string, limit = 100) {
   const [faceted, listed] = await Promise.all([
     search(uid, { q: '', limit: 0, facets: ['doc_id'] }),
     search(uid, {
       q: '',
       limit,
       distinct: 'doc_id',
-      attributesToRetrieve: ['doc_id', 'filename', 'total_pages', 'ocr', 'indexed_at'],
+      attributesToRetrieve: ['doc_id', 'filename', 'filepath', 'file_hash', 'file_size', 'total_pages', 'ocr', 'indexed_at'],
       sort: ['indexed_at:desc']
     })
   ]);
@@ -180,6 +221,9 @@ export async function summariseDocuments(uid, limit = 100) {
     documents: (listed.hits ?? []).map((hit) => ({
       doc_id: hit.doc_id,
       filename: hit.filename,
+      filepath: hit.filepath ?? null,
+      file_hash: hit.file_hash ?? null,
+      file_size: hit.file_size ?? null,
       total_pages: hit.total_pages,
       chunks: chunkCounts[hit.doc_id] ?? null,
       ocr: hit.ocr,
@@ -189,13 +233,13 @@ export async function summariseDocuments(uid, limit = 100) {
 }
 
 /** Empties an index but keeps it and its settings in place. */
-export async function clearDocuments(uid) {
+export async function clearDocuments(uid: string) {
   const task = await request(`/indexes/${uid}/documents`, { method: 'DELETE' });
   return waitForTask(task.taskUid);
 }
 
 /** Drops the index entirely, settings included. */
-export async function dropIndex(uid) {
+export async function dropIndex(uid: string) {
   const task = await request(`/indexes/${uid}`, { method: 'DELETE' });
   const result = await waitForTask(task.taskUid);
   // The next write has to recreate the index and reapply settings.

@@ -1,7 +1,8 @@
+import { errorMessage } from './types.ts';
 import { PDFiumLibrary } from '@hyzyla/pdfium';
 import { PNG } from 'pngjs';
 
-import { config } from '../config.js';
+import { config } from '../config.ts';
 
 const PROMPT = [
   'Transcribe all text visible in this image, exactly as written.',
@@ -14,7 +15,7 @@ const PROMPT = [
  * PDFium returns BGRA pixels; PNG expects RGBA. Swapping the red and blue channels
  * is enough to convert between them.
  */
-function bgraToPng(width, height, bgra) {
+function bgraToPng(width: number, height: number, bgra: Uint8Array) {
   const png = new PNG({ width, height });
   for (let i = 0; i < bgra.length; i += 4) {
     png.data[i] = bgra[i + 2];
@@ -29,9 +30,9 @@ function bgraToPng(width, height, bgra) {
  * Renders the requested 1-based pages of a PDF to PNG buffers.
  * A fresh library instance per call keeps concurrent requests from sharing WASM state.
  */
-export async function renderPdfPages(pdfBuffer, pageNumbers) {
+export async function renderPdfPages(pdfBuffer: Buffer, pageNumbers: number[]) {
   const library = await PDFiumLibrary.init();
-  const images = new Map();
+  const images = new Map<number, Buffer>();
 
   try {
     const document = await library.loadDocument(pdfBuffer);
@@ -54,7 +55,7 @@ export async function renderPdfPages(pdfBuffer, pageNumbers) {
 }
 
 /** Number of pages in a PDF, or null when the buffer is not a readable PDF. */
-export async function getPdfPageCount(pdfBuffer) {
+export async function getPdfPageCount(pdfBuffer: Buffer) {
   let library;
   try {
     library = await PDFiumLibrary.init();
@@ -72,7 +73,7 @@ export async function getPdfPageCount(pdfBuffer) {
 }
 
 /** Sends one image to the Ollama vision model and returns the transcribed text. */
-export async function transcribeImage(imageBuffer) {
+export async function transcribeImage(imageBuffer: Buffer): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.ocr.timeoutMs);
 
@@ -106,8 +107,8 @@ export async function transcribeImage(imageBuffer) {
 }
 
 /** Runs `worker` over `items` with a bounded number of parallel calls. */
-async function mapLimit(items, limit, worker) {
-  const results = [];
+async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>) {
+  const results: R[] = [];
   let cursor = 0;
 
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -125,20 +126,20 @@ async function mapLimit(items, limit, worker) {
  * OCRs the given 1-based PDF pages.
  * @returns {Promise<{texts: Map<number, string>, failures: Array<{page: number, error: string}>}>}
  */
-export async function ocrPdfPages(pdfBuffer, pageNumbers) {
+export async function ocrPdfPages(pdfBuffer: Buffer, pageNumbers: number[]) {
   const capped = pageNumbers.slice(0, config.ocr.maxPages);
   const images = await renderPdfPages(pdfBuffer, capped);
 
-  const texts = new Map();
-  const failures = [];
+  const texts = new Map<number, string>();
+  const failures: { page: number; error: string }[] = [];
 
   await mapLimit([...images.keys()], config.ocr.concurrency, async (pageNumber) => {
     try {
-      const text = await transcribeImage(images.get(pageNumber));
+      const text = await transcribeImage(images.get(pageNumber)!);
       if (text) texts.set(pageNumber, text);
     } catch (error) {
       // One unreadable page should not sink the whole upload.
-      const reason = error.name === 'AbortError' ? `${config.ocr.timeoutMs}ms 초과` : error.message;
+      const reason = error instanceof Error && error.name === 'AbortError' ? `${config.ocr.timeoutMs}ms 초과` : errorMessage(error);
       failures.push({ page: pageNumber, error: reason });
     }
   });

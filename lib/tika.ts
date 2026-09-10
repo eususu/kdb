@@ -1,4 +1,5 @@
-import { config } from '../config.js';
+import type { ExtractedDocument } from './types.ts';
+import { config } from '../config.ts';
 
 /**
  * Tika 4.x only serves plain text from PUT /tika, so page boundaries have to come
@@ -7,7 +8,7 @@ import { config } from '../config.js';
  */
 const PAGE_MARKER = /<div\s+class="(?:page|slide-content)"[^>]*>/gi;
 
-const ENTITIES = {
+const ENTITIES: Record<string, string> = {
   nbsp: ' ',
   lt: '<',
   gt: '>',
@@ -17,7 +18,7 @@ const ENTITIES = {
 };
 
 /** Strips XHTML markup and decodes entities into a single normalised line of text. */
-export function htmlToText(html) {
+export function htmlToText(html: string) {
   return html
     .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
     .replace(/<[^>]*>/g, ' ')
@@ -30,7 +31,7 @@ export function htmlToText(html) {
     .trim();
 }
 
-function safeCodePoint(code) {
+function safeCodePoint(code: number) {
   if (!Number.isInteger(code) || code < 0 || code > 0x10ffff) return ' ';
   try {
     return String.fromCodePoint(code);
@@ -44,7 +45,7 @@ function safeCodePoint(code) {
  * Returns null when the format carries no page markers (DOCX, HTML, plain text, ...),
  * so the caller can fall back to size-based chunking.
  */
-export function splitPages(xhtml) {
+export function splitPages(xhtml: string) {
   const body = xhtml.match(/<body[^>]*>([\s\S]*)<\/body>/i)?.[1] ?? xhtml;
   const starts = [...body.matchAll(PAGE_MARKER)].map((m) => m.index);
   if (starts.length === 0) return null;
@@ -56,7 +57,7 @@ export function splitPages(xhtml) {
 }
 
 /** HTTP headers reject non-ASCII, so the filename hint sent to Tika is stripped down. */
-function asciiFilename(filename) {
+function asciiFilename(filename: string) {
   const cleaned = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\\r\n]/g, '_');
   return cleaned || 'upload';
 }
@@ -65,14 +66,14 @@ function asciiFilename(filename) {
  * Sends the buffer to Tika and returns page text plus the metadata we care about.
  * `pages` is null when the document has no page structure.
  */
-export async function extract(buffer, filename) {
+export async function extract(buffer: Buffer, filename: string): Promise<ExtractedDocument> {
   const response = await fetch(`${config.tikaUrl}/rmeta/html`, {
     method: 'PUT',
     headers: {
       Accept: 'application/json',
       'Content-Disposition': `attachment; filename="${asciiFilename(filename)}"`
     },
-    body: buffer
+    body: new Uint8Array(buffer)
   });
 
   if (!response.ok) {
@@ -100,7 +101,7 @@ export async function extract(buffer, filename) {
   };
 }
 
-function toInt(value) {
+function toInt(value: string) {
   const parsed = Number.parseInt(value, 10);
   return Number.isInteger(parsed) ? parsed : null;
 }

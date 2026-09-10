@@ -1,3 +1,5 @@
+import type { Chunk, ExtractedDocument } from './types.ts';
+
 /**
  * Turns extracted text into Meilisearch-sized chunks.
  *
@@ -8,11 +10,13 @@
  */
 
 /** Merges pages shorter than `minChars` into the following page. */
-function groupPages(pages, minChars) {
-  const groups = [];
-  let buffer = null;
+interface PageGroup { page: number; pageEnd: number; text: string }
 
-  pages.forEach((text, index) => {
+function groupPages(pages: string[], minChars: number) {
+  const groups: PageGroup[] = [];
+  let buffer: PageGroup | null = null;
+
+  for (const [index, text] of pages.entries()) {
     const pageNumber = index + 1;
     if (buffer === null) {
       buffer = { page: pageNumber, pageEnd: pageNumber, text };
@@ -24,7 +28,7 @@ function groupPages(pages, minChars) {
       groups.push(buffer);
       buffer = null;
     }
-  });
+  }
 
   // Trailing remainder is too small to stand alone: fold it into the previous group.
   if (buffer !== null) {
@@ -41,7 +45,7 @@ function groupPages(pages, minChars) {
 }
 
 /** Splits text into <= maxChars windows, preferring word boundaries and keeping an overlap. */
-function splitText(text, maxChars, overlap) {
+function splitText(text: string, maxChars: number, overlap: number) {
   if (text.length <= maxChars) {
     // Merged groups can join whitespace-only pages, so trim before deciding it has content.
     const single = text.trim();
@@ -76,9 +80,9 @@ function splitText(text, maxChars, overlap) {
 /**
  * @returns {Array<{suffix: string, page: number|null, pageEnd: number|null, text: string}>}
  */
-export function buildChunks(extracted, { minChars, maxChars, overlapChars }) {
+export function buildChunks(extracted: Pick<ExtractedDocument, 'pages' | 'fullText'> & Partial<Pick<ExtractedDocument, 'embeddedTexts'>>, { minChars, maxChars, overlapChars }: { minChars: number; maxChars: number; overlapChars: number }): Chunk[] {
   const { pages, fullText, embeddedTexts = [] } = extracted;
-  const chunks = [];
+  const chunks: Chunk[] = [];
 
   if (pages && pages.length > 0) {
     for (const group of groupPages(pages, minChars)) {
